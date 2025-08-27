@@ -94,7 +94,7 @@ class VideoUtils {
          * @param targetHeight Target height for the compressed video (default: 720p)
          * @return Path to the compressed video file
          */
-        suspend fun compressVideo(
+        /*suspend fun compressVideo(
             context: Context,
             videoPath: String,
             targetHeight: Int = 720, // Default to 720p
@@ -173,6 +173,113 @@ class VideoUtils {
                     // Set up cancellation handling
                     continuation.invokeOnCancellation {
                         transcodeFuture.cancel(true)
+                        outputFile.delete()
+                    }
+                }
+            }
+        }*/
+        suspend fun compressVideo(
+            context: Context,
+            videoPath: String,
+            targetHeight: Int = 720
+        ): String {
+            require(targetHeight > 0) { "Target height must be positive" }
+            withContext(Dispatchers.IO) {
+                require(File(videoPath).exists()) { "Input video file does not exist" }
+            }
+
+            // ---- FAST-PATH: evitar re-encode si ya es pequeño y con bitrate moderado
+            val retriever = MediaMetadataRetriever().apply { setDataSource(videoPath) }
+            val srcWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            val srcHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val srcBitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+            retriever.release()
+
+            val effectiveHeight = if ((rotation % 180) != 0) srcWidth else srcHeight
+
+            // umbral simple por altura destino
+            val bitrateThreshold = when (targetHeight) {
+                in 1..720 -> 2_200_000
+                in 721..1080 -> 3_800_000
+                else -> 5_000_000
+            }
+            if (effectiveHeight <= targetHeight && srcBitrate in 1..bitrateThreshold) {
+                val tempDir = context.getExternalFilesDir("easy_video_editor")!!.absolutePath
+                val out = File(
+                    tempDir,
+                    "VID_${SimpleDateFormat("yyyy-MM-dd-HH-mm-ss", Locale.US).format(Date())}_${videoPath.hashCode()}_copy.mp4"
+                )
+                withContext(Dispatchers.IO) {
+                    out.parentFile?.mkdirs()
+                    if (out.exists()) out.delete()
+                    File(videoPath).inputStream().use { i -> out.outputStream().use { o -> i.copyTo(o) } }
+                }
+                return out.absolutePath
+            }
+
+            // ---- salida
+            val tempDir: String = context.getExternalFilesDir("easy_video_editor")!!.absolutePath
+            val outputFileName = "VID_${SimpleDateFormat("yyyy-MM-dd-HH-mm-ss", Locale.US).format(Date())}_${videoPath.hashCode()}.mp4"
+            val outputPath = "$tempDir${File.separator}$outputFileName"
+            val outputFile = File(outputPath).apply { if (exists()) delete() }
+
+            // ---- bitrate objetivo (0.10.5 soporta .bitRate())
+            val targetBitrate: Long = when (targetHeight) {
+                in 1..720 -> 2_000_000
+                in 721..1080 -> 3_500_000
+                else -> 5_000_000
+            }
+
+            val videoStrategy = DefaultVideoStrategy
+                .atMost(targetHeight)
+                .bitRate(targetBitrate)
+                .frameRate(30)
+                .build()
+
+            // Audio más rápido: mono + 44.1 kHz
+            val audioStrategy = DefaultAudioStrategy.builder()
+                .channels(1)
+                .sampleRate(44100)
+                .build()
+
+            return withContext(Dispatchers.Default) {
+                suspendCancellableCoroutine { continuation ->
+                    val dataSource = UriDataSource(context, videoPath.toUri())
+
+                    val future = Transcoder.into(outputPath)
+                        .addDataSource(dataSource)
+                        .setVideoTrackStrategy(videoStrategy)
+                        .setAudioTrackStrategy(audioStrategy) // si quieres omitir audio, no llames a esto
+                        .setListener(object : TranscoderListener {
+                            override fun onTranscodeProgress(progress: Double) {
+                                ProgressManager.getInstance().reportProgress(progress)
+                            }
+                            override fun onTranscodeCompleted(successCode: Int) {
+                                if (continuation.isActive) {
+                                    ProgressManager.getInstance().reportProgress(1.0)
+                                    continuation.resume(outputPath)
+                                }
+                            }
+                            override fun onTranscodeCanceled() {
+                                if (continuation.isActive) {
+                                    continuation.resumeWithException(VideoException("Video compression was canceled"))
+                                }
+                                outputFile.delete()
+                            }
+                            override fun onTranscodeFailed(exception: Throwable) {
+                                if (continuation.isActive) {
+                                    continuation.resumeWithException(
+                                        VideoException("Failed to compress video: ${exception.message}", exception)
+                                    )
+                                }
+                                outputFile.delete()
+                            }
+                        })
+                        .transcode()
+
+                    continuation.invokeOnCancellation {
+                        future.cancel(true)
                         outputFile.delete()
                     }
                 }
